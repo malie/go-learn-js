@@ -1,0 +1,16 @@
+{
+  "name": "go-learn-js",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Markus Liedl",
+  "license": "BSD-3-Clause",
+  "dependencies": {
+    "fs-walk": "0.0.1",
+    "smartgame": "^0.1.4",
+    "smartgamer": "^0.1.4"
+  }
+}
