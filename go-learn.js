@@ -351,7 +351,8 @@ function batchedPatchesPerPlace(pw, ph, batchsize, callback) {
 	  var take = patches.slice(0, batchsize)
 	  patches = patches.slice(batchsize)
 	  var co = go.coord.fromIndex(idx)
-	  callback(co, take)}}
+	  if (!callback(co, take))
+	    return 'done'}}
       npl.set(idx, patches)}
     pl = npl}}
 
@@ -414,116 +415,353 @@ function decodeData(patch, dat) {
   return res}
 
 
-function prepareMinibatches(pw, ph, minibatchSize, noiseLevel,
-			    callback) {
+function prepareMinibatches(pw, ph, minibatchSize, callback) {
   batchedPatchesPerPlace(
     pw, ph, minibatchSize,
     function (coord, patches) {
-      // console.log('batch for', coord.toString())
-      var obatch = []
-      var nbatch = []
-      var pbatch = []
-      for (var p of patches) {
-	obatch.push(encodePatch(p))
-	nbatch.push(encodePatch(p.cloneWithNoise(noiseLevel)))
-	pbatch.push(encodePatch(p.cloneWithNoNext()))}
-      callback(coord, patches, obatch, nbatch, pbatch)})}
+      var batch = new goBatch(coord, patches)
+      return callback(batch)})}
 
-function prepareTestInput(patches) {
-  return patches.map(p => p.cloneWithNoise())}
+
+class abstractLayer {
+  numOutputs() { throw 'abstract'}
+  layerAbove() { throw 'abstract'}
+  setLayerAbove() { throw 'abstract'}
+}
+
+class middleLayer extends abstractLayer {
+  layerBelow() { throw 'abstract'}
+  setLayerBelow() { throw 'abstract'}
+  numInputs() {
+    return this.layerBelow().numOutputs()}
+}  
+
+class stdLayer extends middleLayer {
+  constructor() {
+    super()
+    this._layerAbove = null
+    this._layerBelow = null}
+  layerAbove() { return this._layerAbove }
+  setLayerAbove(l) {
+    this._layerAbove = l
+    l.setLayerBelow(this)}
+  layerBelow() { return this._layerBelow }
+  setLayerBelow(l) {
+    this._layerBelow = l}
+}
+
+class inputLayer extends abstractLayer {
+  constructor(dataSize) {
+    super()
+    this.dataSize = dataSize}
+  layerAbove() { return this._layerAbove}
+  setLayerAbove(l) {
+    this._layerAbove = l
+    l.setLayerBelow(this)}
+  numOutputs() {
+    return this.dataSize}
+}
+
+class autoencoderLayer extends stdLayer {
+  constructor(t, layerdef) {
+    super()
+    this.t = t
+    this.numFilters = layerdef.numFilters
+    this.numProcessedBatches = 0}
+  numOutputs() {
+    return this.numFilters}
+  finish() {
+    var t = this.t
+    var numInputs = this.numInputs()
+    this.filters = t.tensor('filters', [this.numFilters, numInputs])
+    this.biasa = t.tensor('biasa', [this.numFilters])
+    this.biasb = t.tensor('biasb', [numInputs])
+    this.filtersT = ad.randomTensor([this.numFilters, numInputs], 0.03)
+    this.biasaT = ad.randomTensor([this.numFilters], 0.01)
+    this.biasbT = ad.randomTensor([numInputs], 0.01)}
+  calcHiddens(minibatchSize, input) {
+    var t = this.t
+    var act = t.add(
+      t.einsum('ac,bc->ab', input, this.filters),
+      t.einsum('b,ab->ab', this.biasa,
+	       t.ones([minibatchSize, this.numFilters])))
+    return t.sigmoid(act)}
+  calcRecons(minibatchSize, hiddens) {
+    var t = this.t
+    var reconsAct = t.add(
+      t.einsum('ac,cb->ab', hiddens, this.filters),
+      t.einsum('b,ab->ab',
+	       this.biasb,
+	       t.ones([minibatchSize, this.numInputs()])))
+    return t.sigmoid(reconsAct)}
+  calcReconstructionError(origInput, recons) {
+    var t = this.t
+    return t.squaredSum(t.sub(origInput, recons))}
+
+  compileErrorFunction(minibatchSize) {
+    if (!this.compiledErrorFunction) {
+      var ni = this.numInputs()
+      var t = this.t
+      this.noisedInput = t.tensor('noisedInput', [minibatchSize, ni])
+      this.origInput = t.tensor('origInput', [minibatchSize, ni])
+      this.hiddens = this.calcHiddens(minibatchSize, this.noisedInput)
+      this.recons = this.calcRecons(minibatchSize, this.hiddens)
+      this.err = this.calcReconstructionError(this.origInput,
+					      this.recons)
+      console.log(util.inspect(this.err, 0, 10))
+      var comp = new ad.asmjsCompiler(this.t)
+      this.compiledErrorFunction =
+	comp.compile(this.err, this.neededDerivatives())}
+    return this.compiledErrorFunction}
+
+  learningDone() {
+    this.noisedInput = null
+    this.origInput = null
+    this.hiddens = null
+    this.recons = null
+    this.err = null
+    this.compiledErrorFunction = null}
+
+  bindParameters(func) {
+    func.bind(this.filters, this.filtersT)
+    func.bind(this.biasa, this.biasaT)
+    func.bind(this.biasb, this.biasbT)}
+
+  neededDerivatives() {
+    // only called when layer is in learning mode, i.e. topmost
+    return [this.filters, this.biasa, this.biasb]}
+
+  applyUpdates(learnRate, batchSize, err, gradients) {
+    var gradFilters = gradients[0]
+    var gradBiasa = gradients[1]
+    var gradBiasb = gradients[2]
+    var learnRate = 0.01
+    function subtract(a,b) {
+      return a-learnRate*b}
+    function learn(params, grad) {
+      return ad.zipTensor(params, grad, subtract)}
+
+    this.filtersT = learn(this.filtersT, gradFilters)
+    this.biasaT = learn(this.biasaT, gradBiasa)
+    this.biasbT = learn(this.biasbT, gradBiasb)
+
+    var errp = round(3, Math.sqrt(err / this.numInputs() / batchSize))
+    console.log(this.numProcessedBatches , 'err', round(2, err), errp)
+    this.numProcessedBatches++
+    ////// , spent,
+    ////// nonoise ? 'nonoise'
+    //////   : test ? 'test' : '')
+  }
+}
+
+function round(d, x) {
+  var f = Math.pow(10, d)
+  return Math.round(x * f) / f}
+
+class stackedAutoencoders {
+  constructor(t, inputLayer, layerdefs) {
+    console.log('layerdefs', layerdefs)
+    this.t = t
+    this.inputLayer = inputLayer
+    this.layerdefs = layerdefs
+    this.current = 0
+    this.layers = []
+  }
+  learnCurrentLayer(minibatchSize) {
+    assert(this.current < this.layerdefs.length)
+    var layerdef = this.layerdefs[this.current]
+    console.log('\n\n\nlearning layer', this.current, layerdef)
+
+    var ae = new autoencoderLayer(this.t, layerdef)
+    this.layers[this.current] = ae
+    if (this.current == 0)
+      this.inputLayer.setLayerAbove(ae)
+    else
+      this.layers[this.current-1].setLayerAbove(ae)
+    ae.finish()
+    ae.compileErrorFunction(minibatchSize)}
+
+  nextLayer() {
+    this.layers[this.current].learningDone()
+    this.current++
+    return this.current < this.layerdefs.length}
+  
+  learnBatch(batch, learnRate, noiseLevel) {
+    var ae = this.layers[this.current]
+    var origInputT = null
+    var noisedInputT = null
+    if (this.current === 0) {
+      origInputT = batch.encodeOrig()
+      noisedInputT = batch.encodeWithNoise(noiseLevel)}
+    else {
+      // todo: map batch with non-current encoders
+      // todo: apply noise
+      throw 'todo'}
+    var start = +new Date()
+    var f = ae.compileErrorFunction()
+    f.bind(ae.noisedInput, noisedInputT)
+    f.bind(ae.origInput, origInputT)
+    ae.bindParameters(f)
+    f.call()
+    ae.applyUpdates(
+      learnRate,
+      batch.batchSize(),
+      f.valueForId(ae.err.id),
+      ae.neededDerivatives().map(v => f.adjointForId(v.id)))
+  }
+  testReconsBatch(batch) {
+    var ae = this.layers[this.current]
+    var origInputT = null
+    if (this.current === 0)
+      origInputT = batch.encodeOrig()
+    else {
+      // todo: map batch with non-current encoders
+      // todo: apply noise
+      throw 'todo'}
+    var start = +new Date()
+    var f = ae.compileErrorFunction()
+    f.bind(ae.origInput, origInputT)
+    f.bind(ae.noisedInput, origInputT)
+    ae.bindParameters(f)
+    f.call()
+    return f.valueForId(ae.err.id)}
+  
+  testPredictionBatch(batch) {
+    var ae = this.layers[this.current]
+    var origInputT = null
+    var predInputT = null
+    if (this.current === 0) {
+      origInputT = batch.encodeOrig()
+      predInputT = batch.encodePred()}
+    else {
+      // todo: map batch with non-current encoders
+      // todo: apply noise
+      throw 'todo'}
+    var start = +new Date()
+    var f = ae.compileErrorFunction()
+    f.bind(ae.noisedInput, predInputT)
+    f.bind(ae.origInput, origInputT)
+    ae.bindParameters(f)
+    f.call()
+    return {err: f.valueForId(ae.err.id),
+	    recons: f.valueForId(ae.recons.id)}}
+}
+
+class goBatch {
+  constructor(coord, patches) {
+    this.coord = coord
+    this.patches = patches}
+  batchSize() {
+    return this.patches.length}
+  encodeOrig() {
+    return this.patches.map(encodePatch)}
+  encodePred() {
+    return (this.patches
+	    .map(p => encodePatch(p.cloneWithNoNext())))}
+  encodeWithNoise(noiseLevel) {
+    return (this.patches
+	    .map(p => encodePatch(p.cloneWithNoise(noiseLevel))))}}
+
+function reportPrediction(batch, recons) {
+  var numExamples = Math.min(10, batch.batchSize())
+  for (var b = 0; b < numExamples; b++) {
+    var patch = batch.patches[b]
+    var re = decodeData(patch, recons[b])
+    console.log(patch.toString())
+    re.sort(function (a,b) {return b.doPlay - a.doPlay})
+    var output = []
+    for (var i = 0; i < 5; i++) {
+      var r = re[i]
+      output.push(r.coord.toString()
+		  + ' '
+		  + round(3, r.doPlay))}
+    console.log(output.join('  ') + '\n')}}
+
 
 
 function learn() {
-  var noiseLevel = 0.10
-  
-  var minibatchSize = 20
+  var noiseLevel = 0.40
+  var minibatchSize = 100
   var dataSize = 203+2*25  // for 5x5
-  var numFilters = 60
-  var learnRate = 0.03
+  var learnRate = 0.01
 
   console.log('noiseLevel', noiseLevel)
   console.log('minibatchSize', minibatchSize)
-  console.log('numFilters', numFilters)
   console.log('learnRate', learnRate)
   
   var t = new ad.T()
-  var origInput = t.tensor('origInput', [minibatchSize, dataSize])
-  var noisedInput = t.tensor('noisedInput', [minibatchSize, dataSize])
-  var filters = t.tensor('filters', [numFilters, dataSize])
-  var biasa = t.tensor('biasa', [numFilters])
-  var biasb = t.tensor('biasb', [dataSize])
+  var input = new inputLayer(dataSize)
+  var sa = new stackedAutoencoders(t,
+				   input,
+				   [{numFilters: 100}])
 
-  var act = t.add(
-    t.einsum('ac,bc->ab', noisedInput, filters),
-    t.einsum('b,ab->ab', biasa, t.ones([minibatchSize, numFilters])))
-  var repr = t.sigmoid(act)
-  var reconsAct = t.add(
-    t.einsum('ac,cb->ab', repr, filters),
-    t.einsum('b,ab->ab', biasb, t.ones([minibatchSize, dataSize])))
+  // todo: loop over layers in sa
+  // console.log('num parameters:', (numFilters+1)*(dataSize+1)-1)
 
-  var recons = t.sigmoid(reconsAct)
-  var err = t.squaredSum(t.sub(origInput, recons))
+  sa.learnCurrentLayer(minibatchSize)
 
-  var filtersT = ad.randomTensor([numFilters, dataSize], 0.03)
-  var biasaT = ad.randomTensor([numFilters], 0.01)
-  var biasbT = ad.randomTensor([dataSize], 0.01)
-
-  console.log('num parameters:', (numFilters+1)*(dataSize+1)-1)
-  
-  console.log(util.inspect(err, 0, 10))
-  var comp = new ad.asmjsCompiler(t)
-  var tr = comp.compile(err, [filters, biasa, biasb])
-
-  var count = 0;
+  var count = 0
+  var t = 1
   prepareMinibatches(
-    5, 5, minibatchSize, noiseLevel,
-    function (coord, patches, obatch, nbatch, pbatch) {
-      if (coord.toString() != 'A1') return
+    5, 5, minibatchSize,
+    function (batch) {
+      if (batch.coord.toString() != 'A1') return true
       count++
-      var cmod = count%100
-      var nonoise = cmod > 90
-      var test = cmod >= 99
-      var start = +new Date()
-      tr.bind(origInput, obatch)
-      tr.bind(noisedInput, (nonoise ? (test ? pbatch : obatch)
-			    : nbatch))
-      tr.bind(filters, filtersT)
-      tr.bind(biasa, biasaT)
-      tr.bind(biasb, biasbT)
-      tr.call()
-      var end = +new Date()
-      var spent = end - start
-
-      if (nonoise) {
-	if (test) {
-	  var rec = tr.valueForId(recons.id)
-	  for (var b = 0; b < Math.min(5, minibatchSize); b++) {
-	    var patch = patches[b]
-	    var re = decodeData(patch, rec[b])
-	    console.log(patch.toString())
-	    re.sort(function (a,b) {return b.doPlay - a.doPlay})
-	    for (var i = 0; i < 5; i++) {
-	      var r = re[i]
-	      console.log(r.coord.toString(), r.doPlay)}
-	    console.log('\n')
-	  }
+      if (count == 50000)
+	return false // end // todo: should depend on test err
+      var modCount = count % 100
+      if (modCount < 100-2*t)
+	sa.learnBatch(batch, learnRate, noiseLevel)
+      else {
+	var predict = modCount >= 100-t
+	if (!predict) {
+	  var err = sa.testReconsBatch(batch)
+	  console.log('test recons err', err)}
+	else {
+	  var res = sa.testPredictionBatch(batch)
+	  console.log('test prediction err', res.err)
+	  reportPrediction(batch, res.recons)
 	}
       }
-      else {
-	filtersT = ad.zipTensor(filtersT,
-    				tr.adjointForId(filters.id),
-    				(a,b) => a-learnRate*b)
-	biasaT = ad.zipTensor(biasaT,
-    			      tr.adjointForId(biasa.id),
-    			      (a,b) => a-learnRate*b)
-	biasbT = ad.zipTensor(biasbT,
-    			      tr.adjointForId(biasb.id),
-    			      (a,b) => a-learnRate*b)}
-	
-      console.log(count, 'err', tr.valueForId(err.id), spent,
-		  nonoise ? 'nonoise'
-		  : test ? 'test' : '')
-    })}
+      return true})
+  
+  // var count = 0;
+
+  // ////.....
+  //     count++
+  //     var cmod = count%100
+  //     var nonoise = cmod > 90
+  //     var test = cmod >= 99
+  //     var start = +new Date()
+  //     tr.bind(origInput, batch.obatch)
+  //     tr.bind(noisedInput,
+  // 	      (nonoise ? (test ? batch.pbatch : batch.obatch)
+  // 	       : batch.nbatch))
+  //     tr.bind(filters, filtersT)
+  //     tr.bind(biasa, biasaT)
+  //     tr.bind(biasb, biasbT)
+  //     tr.call()
+  //     var end = +new Date()
+  //     var spent = end - start
+
+  //     if (nonoise) {
+  // 	if (test) {
+  // 	  var rec = tr.valueForId(recons.id)
+  // 	  for (var b = 0; b < Math.min(5, minibatchSize); b++) {
+  // 	    var patch = batch.patches[b]
+  // 	    var re = decodeData(patch, rec[b])
+  // 	    console.log(patch.toString())
+  // 	    re.sort(function (a,b) {return b.doPlay - a.doPlay})
+  // 	    for (var i = 0; i < 5; i++) {
+  // 	      var r = re[i]
+  // 	      console.log(r.coord.toString(), r.doPlay)}
+  // 	    console.log('\n')
+  // 	  }
+  // 	}
+  //     }
+  //     else {
+  // })
+}
 
 
 learn()
