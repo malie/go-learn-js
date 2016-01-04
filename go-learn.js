@@ -195,7 +195,9 @@ function extractPatch(width, height, board, col, coord, place) {
       var libs = 0
       if (st !== go.empty)
 	libs = board.numLibsAt(co)
-      line.push({col: st, libs: libs, next: coord.equals(co)})}
+      line.push({col: st,
+		 libs: libs,
+		 next: coord.equals(co) ? true : false})}
     lines.push(line)}
   return new patch(new go.coord(px, py), lines)}
 
@@ -259,6 +261,16 @@ class patch {
 	  li.push(l)
 	else
 	  li.push(null)}
+      lines.push(li)}
+    return new patch(this.coord, lines)}
+  cloneWithNoNext(p) {
+    var lines = []
+    for (var line of this.lines) {
+      var li = []
+      for (var l of line) {
+	li.push({col: l.col,
+		 libs: l.libs,
+		 next: null})}
       lines.push(li)}
     return new patch(this.coord, lines)}
 }
@@ -339,8 +351,8 @@ function batchedPatchesPerPlace(pw, ph, batchsize, callback) {
 	  var take = patches.slice(0, batchsize)
 	  patches = patches.slice(batchsize)
 	  var co = go.coord.fromIndex(idx)
-	  callback(co, take)}
-	npl.set(idx, patches)}}
+	  callback(co, take)}}
+      npl.set(idx, patches)}
     pl = npl}}
 
 function encodePatch(patch) {
@@ -360,8 +372,8 @@ function encodePatch(patch) {
       add(b)
       add(w)
       add(o && o.col === go.empty)
-      add(o && o.next)
-      add(o && !o.next)
+      add(o && o.next === true)
+      add(o && o.next === false)
       if (border) {
 	add(b && o.libs === 1)
 	add(b && o.libs === 2)
@@ -373,6 +385,34 @@ function encodePatch(patch) {
 	add(w && o.libs >= 4)}}}
   return bits}
 
+function decodeData(patch, dat) {
+  var res = []
+  var ptr = 0
+  function get(x) {
+    return dat[ptr++]}
+  var xb = patch.coord.x()
+  var yb = patch.coord.y()
+  var lsl = patch.lines.length
+  var ll = patch.lines[0].length
+  for (var i = 0; i < lsl; i++) {
+    for (var j = 0; j < ll; j++) {
+      var border = i === 0 || j === 0 || i === lsl-1 || j === ll-1
+      get() // b
+      get() // w
+      get() // empty
+      var doPlay = get()
+      var dontPlay = get()
+      if (border) {
+	get();get();get();get(); // 1,2,3,>=4 libs b
+	get();get();get();get(); // 1,2,3,>=4 libs w
+      }
+      res.push({coord: new go.coord(xb+j, yb+i),
+		doPlay: doPlay,
+		dontPlay: dontPlay})
+    }}
+  assert.equal(dat.length, ptr)
+  return res}
+
 
 function prepareMinibatches(pw, ph, minibatchSize, noiseLevel,
 			    callback) {
@@ -382,23 +422,30 @@ function prepareMinibatches(pw, ph, minibatchSize, noiseLevel,
       // console.log('batch for', coord.toString())
       var obatch = []
       var nbatch = []
+      var pbatch = []
       for (var p of patches) {
-	var noised = p.cloneWithNoise(noiseLevel)
-	// console.log(p.toString())
-	// console.log(noised.toString())
 	obatch.push(encodePatch(p))
-	nbatch.push(encodePatch(noised))}
-      callback(coord, obatch, nbatch)})}
+	nbatch.push(encodePatch(p.cloneWithNoise(noiseLevel)))
+	pbatch.push(encodePatch(p.cloneWithNoNext()))}
+      callback(coord, patches, obatch, nbatch, pbatch)})}
+
+function prepareTestInput(patches) {
+  return patches.map(p => p.cloneWithNoise())}
 
 
 function learn() {
-  var noiseLevel = 0.40
+  var noiseLevel = 0.10
   
   var minibatchSize = 20
   var dataSize = 203+2*25  // for 5x5
-  var numFilters = 40
-  var learnRate = 0.01
+  var numFilters = 60
+  var learnRate = 0.03
 
+  console.log('noiseLevel', noiseLevel)
+  console.log('minibatchSize', minibatchSize)
+  console.log('numFilters', numFilters)
+  console.log('learnRate', learnRate)
+  
   var t = new ad.T()
   var origInput = t.tensor('origInput', [minibatchSize, dataSize])
   var noisedInput = t.tensor('noisedInput', [minibatchSize, dataSize])
@@ -430,13 +477,16 @@ function learn() {
   var count = 0;
   prepareMinibatches(
     5, 5, minibatchSize, noiseLevel,
-    function (coord, obatch, nbatch) {
+    function (coord, patches, obatch, nbatch, pbatch) {
       if (coord.toString() != 'A1') return
       count++
-      var nonoise = count%100 > 90
+      var cmod = count%100
+      var nonoise = cmod > 90
+      var test = cmod >= 99
       var start = +new Date()
       tr.bind(origInput, obatch)
-      tr.bind(noisedInput, nonoise ? obatch : nbatch)
+      tr.bind(noisedInput, (nonoise ? (test ? pbatch : obatch)
+			    : nbatch))
       tr.bind(filters, filtersT)
       tr.bind(biasa, biasaT)
       tr.bind(biasb, biasbT)
@@ -444,7 +494,22 @@ function learn() {
       var end = +new Date()
       var spent = end - start
 
-      if (!nonoise) {
+      if (nonoise) {
+	if (test) {
+	  var rec = tr.valueForId(recons.id)
+	  for (var b = 0; b < Math.min(5, minibatchSize); b++) {
+	    var patch = patches[b]
+	    var re = decodeData(patch, rec[b])
+	    console.log(patch.toString())
+	    re.sort(function (a,b) {return b.doPlay - a.doPlay})
+	    for (var i = 0; i < 5; i++) {
+	      var r = re[i]
+	      console.log(r.coord.toString(), r.doPlay)}
+	    console.log('\n')
+	  }
+	}
+      }
+      else {
 	filtersT = ad.zipTensor(filtersT,
     				tr.adjointForId(filters.id),
     				(a,b) => a-learnRate*b)
@@ -456,7 +521,8 @@ function learn() {
     			      (a,b) => a-learnRate*b)}
 	
       console.log(count, 'err', tr.valueForId(err.id), spent,
-		  nonoise ? 'nonoise' : '')
+		  nonoise ? 'nonoise'
+		  : test ? 'test' : '')
     })}
 
 
