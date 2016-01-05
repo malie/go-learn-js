@@ -467,9 +467,14 @@ class autoencoderLayer extends stdLayer {
     super()
     this.t = t
     this.numFilters = layerdef.numFilters
-    this.numProcessedBatches = 0}
+    this.numBatches = layerdef.numBatches
+    this.numProcessedBatches = 0
+    this.mapper = null}
   numOutputs() {
     return this.numFilters}
+  isTrainingFinished() {
+    return (this.numBatches
+	    && this.numProcessedBatches > this.numBatches)}
   finish() {
     var t = this.t
     var numInputs = this.numInputs()
@@ -479,6 +484,12 @@ class autoencoderLayer extends stdLayer {
     this.filtersT = ad.randomTensor([this.numFilters, numInputs], 0.03)
     this.biasaT = ad.randomTensor([this.numFilters], 0.01)
     this.biasbT = ad.randomTensor([numInputs], 0.01)}
+
+  numParameters() {
+    return (ad.shapeNumElements(this.filters.shape())
+	    + ad.shapeNumElements(this.biasa.shape())
+	    + ad.shapeNumElements(this.biasb.shape()))}
+
   calcHiddens(minibatchSize, input) {
     var t = this.t
     var act = t.add(
@@ -544,19 +555,57 @@ class autoencoderLayer extends stdLayer {
     this.filtersT = learn(this.filtersT, gradFilters)
     this.biasaT = learn(this.biasaT, gradBiasa)
     this.biasbT = learn(this.biasbT, gradBiasb)
+    this.numProcessedBatches++}
 
-    var errp = round(3, Math.sqrt(err / this.numInputs() / batchSize))
-    console.log(this.numProcessedBatches , 'err', round(2, err), errp)
-    this.numProcessedBatches++
-    ////// , spent,
-    ////// nonoise ? 'nonoise'
-    //////   : test ? 'test' : '')
-  }
+  mapBatch(batch) {
+    if (!this.mapper) {
+      var minibatchSize = batch.length
+      var inputShape = [minibatchSize, this.numInputs()]
+      this.mapperInput = this.t.tensor('input', inputShape)
+      this.mapperHid =
+	this.calcHiddens(minibatchSize, this.mapperInput)
+      var comp = new ad.asmjsCompiler(this.t)
+      this.mapper = comp.compile(this.mapperHid, [])}
+    var m = this.mapper
+    m.bind(this.filters, this.filtersT)
+    m.bind(this.biasa, this.biasaT)
+    m.bind(this.mapperInput, batch)
+    m.call()
+    return m.valueForId(this.mapperHid.id)}
+
+  mapBatchBack(batch) {
+    if (!this.backMapper) {
+      var minibatchSize = batch.length
+      var outputShape = [minibatchSize, this.numOutputs()]
+      this.backMapperOutput = this.t.tensor('output', outputShape)
+      this.backMapperInput =
+	this.calcRecons(minibatchSize, this.backMapperOutput)
+      var comp = new ad.asmjsCompiler(this.t)
+      this.backMapper = comp.compile(this.backMapperInput, [])}
+    var m = this.backMapper
+    m.bind(this.filters, this.filtersT)
+    m.bind(this.biasb, this.biasbT)
+    m.bind(this.backMapperOutput, batch)
+    m.call()
+    return m.valueForId(this.backMapperInput.id)}
+
+  parametersForSaving() {
+    return {type: 'autoencoderLayer',
+	    numProcessedBatches: this.numProcessedBatches,
+	    numInputs: this.numInputs(),
+	    numOutputs: this.numOutputs(),
+	    filters: this.filtersT,
+	    biasa: this.biasaT,
+	    biasb: this.biasbT}}
 }
 
 function round(d, x) {
   var f = Math.pow(10, d)
   return Math.round(x * f) / f}
+
+function withTiming(start, end, obj) {
+  obj.spent = end - start
+  return obj}
 
 class stackedAutoencoders {
   constructor(t, inputLayer, layerdefs) {
@@ -567,36 +616,53 @@ class stackedAutoencoders {
     this.current = 0
     this.layers = []
   }
+  isTrainingForCurrentLayerFinished() {
+    return this.layers[this.current].isTrainingFinished()}
+
   learnCurrentLayer(minibatchSize) {
     assert(this.current < this.layerdefs.length)
     var layerdef = this.layerdefs[this.current]
     console.log('\n\n\nlearning layer', this.current, layerdef)
 
     var ae = new autoencoderLayer(this.t, layerdef)
+    
     this.layers[this.current] = ae
     if (this.current == 0)
       this.inputLayer.setLayerAbove(ae)
     else
       this.layers[this.current-1].setLayerAbove(ae)
     ae.finish()
-    ae.compileErrorFunction(minibatchSize)}
+    ae.compileErrorFunction(minibatchSize)
+    console.log('num parameters:', ae.numParameters())}
 
   nextLayer() {
     this.layers[this.current].learningDone()
     this.current++
     return this.current < this.layerdefs.length}
+
+  mapBatchThroughLayers(batch, last) {
+    var dat = batch.encodeOrig()
+    for (var i = 0; i < last; i++)
+      dat = this.layers[i].mapBatch(dat)
+    return dat}
+  
+  mapBatchBackThroughLayers(dat, last) {
+    for (var i = last; i >= 0; i--)
+      dat = this.layers[i].mapBatchBack(dat)
+    return dat}
   
   learnBatch(batch, learnRate, noiseLevel) {
     var ae = this.layers[this.current]
     var origInputT = null
     var noisedInputT = null
     if (this.current === 0) {
+      // todo: push encoding into input layer
       origInputT = batch.encodeOrig()
       noisedInputT = batch.encodeWithNoise(noiseLevel)}
     else {
-      // todo: map batch with non-current encoders
-      // todo: apply noise
-      throw 'todo'}
+      var dat = this.mapBatchThroughLayers(batch, this.current)
+      origInputT = dat
+      noisedInputT = applyNoiseToEncodedBatch(dat, noiseLevel)}
     var start = +new Date()
     var f = ae.compileErrorFunction()
     f.bind(ae.noisedInput, noisedInputT)
@@ -608,44 +674,70 @@ class stackedAutoencoders {
       batch.batchSize(),
       f.valueForId(ae.err.id),
       ae.neededDerivatives().map(v => f.adjointForId(v.id)))
-  }
+
+    var end = +new Date()
+    var res = this.reportErrors(ae, f, batch)
+    withTiming(start, end, res)
+    res.numProcessedBatches = ae.numProcessedBatches
+    return res}
+
+  
   testReconsBatch(batch) {
     var ae = this.layers[this.current]
-    var origInputT = null
-    if (this.current === 0)
-      origInputT = batch.encodeOrig()
-    else {
-      // todo: map batch with non-current encoders
-      // todo: apply noise
-      throw 'todo'}
+    var origInputT = this.mapBatchThroughLayers(batch, this.current)
     var start = +new Date()
     var f = ae.compileErrorFunction()
     f.bind(ae.origInput, origInputT)
     f.bind(ae.noisedInput, origInputT)
     ae.bindParameters(f)
     f.call()
-    return f.valueForId(ae.err.id)}
+    var end = +new Date()
+    return withTiming(start, end, this.reportErrors(ae, f, batch))}
+
+  reportErrors(ae, f, batch) {
+    var batchSize = batch.batchSize()
+    var err = f.valueForId(ae.err.id)
+    var errp = round(3, Math.sqrt(err / ae.numInputs() / batchSize))
+    return {err: err, errp: errp}}
   
   testPredictionBatch(batch) {
     var ae = this.layers[this.current]
-    var origInputT = null
+    var origInputT = batch.encodeOrig()
     var predInputT = null
-    if (this.current === 0) {
-      origInputT = batch.encodeOrig()
-      predInputT = batch.encodePred()}
-    else {
-      // todo: map batch with non-current encoders
-      // todo: apply noise
-      throw 'todo'}
     var start = +new Date()
-    var f = ae.compileErrorFunction()
-    f.bind(ae.noisedInput, predInputT)
-    f.bind(ae.origInput, origInputT)
-    ae.bindParameters(f)
-    f.call()
-    return {err: f.valueForId(ae.err.id),
-	    recons: f.valueForId(ae.recons.id)}}
+    if (this.current === 0) {
+      predInputT = batch.encodePred()
+      var f = ae.compileErrorFunction()
+      f.bind(ae.noisedInput, predInputT)
+      f.bind(ae.origInput, origInputT)
+      ae.bindParameters(f)
+      f.call()
+      return {err: f.valueForId(ae.err.id),
+	      recons: f.valueForId(ae.recons.id)}}
+    else {
+      var nnbatch = batch.cloneBatchWithNoNext()
+      var hidT = this.mapBatchThroughLayers(nnbatch, this.current+1)
+      var recons = this.mapBatchBackThroughLayers(hidT, this.current)
+      var err = squaredDiff(origInputT, recons)
+      return {err: err,
+	      recons: recons}}}
+
+  saveParameters() {
+    var filename = 'sa-' + +new Date() + '.par'
+    var params = this.layers.map(l => l.parametersForSaving())
+    fs.writeFileSync(filename, JSON.stringify(params))
+    console.log('wrote parameters to', filename)}
 }
+
+
+function squaredDiff(a, b) {
+  // aww, zip for side effect...
+  var sum = 0
+  ad.zipTensor(a, b, function (a,b) {
+    sum += Math.pow(a-b, 2)
+    return 0})
+  return sum}
+
 
 class goBatch {
   constructor(coord, patches) {
@@ -655,12 +747,25 @@ class goBatch {
     return this.patches.length}
   encodeOrig() {
     return this.patches.map(encodePatch)}
+  cloneBatchWithNoNext() {
+    return new goBatch(this.coord,
+		       this.patches.map(p => p.cloneWithNoNext()))}
   encodePred() {
     return (this.patches
 	    .map(p => encodePatch(p.cloneWithNoNext())))}
   encodeWithNoise(noiseLevel) {
     return (this.patches
 	    .map(p => encodePatch(p.cloneWithNoise(noiseLevel))))}}
+
+function applyNoiseToEncodedBatch(batch, noiseLevel) {
+  function an(dat) {
+    return dat.map(d => {
+      if (Math.random() > noiseLevel)
+	return d
+      else
+	return 0})}
+  return batch.map(an)}
+
 
 function reportPrediction(batch, recons) {
   var numExamples = Math.min(10, batch.batchSize())
@@ -680,10 +785,12 @@ function reportPrediction(batch, recons) {
 
 
 function learn() {
-  var noiseLevel = 0.40
+  var patternSize = 5
+  var noiseLevel = 0.01
   var minibatchSize = 100
-  var dataSize = 203+2*25  // for 5x5
-  var learnRate = 0.01
+  var dataSize = ((patternSize-2)*(patternSize-2)*5
+		  + (2*patternSize-2)*2*13)
+  var learnRate = 0.001
 
   console.log('noiseLevel', noiseLevel)
   console.log('minibatchSize', minibatchSize)
@@ -691,76 +798,54 @@ function learn() {
   
   var t = new ad.T()
   var input = new inputLayer(dataSize)
-  var sa = new stackedAutoencoders(t,
-				   input,
-				   [{numFilters: 100}])
+  var sa = new stackedAutoencoders(
+    t, input,
+    [{numFilters: 200, numBatches: 4000},
+     {numFilters: 200, numBatches: 5000},
+     {numFilters: 200, numBatches: 6000}])
 
-  // todo: loop over layers in sa
-  // console.log('num parameters:', (numFilters+1)*(dataSize+1)-1)
+  while (true) {
+    console.log('starting layer', new Date().toString())
+    sa.learnCurrentLayer(minibatchSize)
 
-  sa.learnCurrentLayer(minibatchSize)
-
-  var count = 0
-  var t = 1
-  prepareMinibatches(
-    5, 5, minibatchSize,
-    function (batch) {
-      if (batch.coord.toString() != 'A1') return true
-      count++
-      if (count == 50000)
-	return false // end // todo: should depend on test err
-      var modCount = count % 100
-      if (modCount < 100-2*t)
-	sa.learnBatch(batch, learnRate, noiseLevel)
-      else {
-	var predict = modCount >= 100-t
-	if (!predict) {
-	  var err = sa.testReconsBatch(batch)
-	  console.log('test recons err', err)}
+    var count = 0
+    var t = 1
+    prepareMinibatches(
+      patternSize, patternSize,
+      minibatchSize,
+      function (batch) {
+	if (batch.coord.toString() != 'A1') return true
+	count++
+	var modCount = count % 100
+	if (modCount < 100-2*t) {
+	  var res = sa.learnBatch(batch, learnRate, noiseLevel)
+	  console.log('' + res.numProcessedBatches
+		      + '\terr ' + round(0, res.err)
+		      + ' ' + round(3, res.errp)
+		      + '\t' + res.spent + 'ms')}
 	else {
-	  var res = sa.testPredictionBatch(batch)
-	  console.log('test prediction err', res.err)
-	  reportPrediction(batch, res.recons)
-	}
-      }
-      return true})
-  
-  // var count = 0;
+	  var predict = modCount >= 100-t
+	  if (!predict) {
+	    var res = sa.testReconsBatch(batch)
+	    console.log('   \terr ' + round(0, res.err)
+			+ ' ' + round(3, res.errp)
+			+ '\t' + res.spent + 'ms')
+	    //if (res.errp < 0.23) // 0.23//0.19//0.16 // 0.13 // 0.10
+	  }
+	  else {
+	    var res = sa.testPredictionBatch(batch)
+	    console.log('test prediction err', res.err)
+	    reportPrediction(batch, res.recons)
+	    if (sa.isTrainingForCurrentLayerFinished())
+	      return false}}
+	return true})
 
-  // ////.....
-  //     count++
-  //     var cmod = count%100
-  //     var nonoise = cmod > 90
-  //     var test = cmod >= 99
-  //     var start = +new Date()
-  //     tr.bind(origInput, batch.obatch)
-  //     tr.bind(noisedInput,
-  // 	      (nonoise ? (test ? batch.pbatch : batch.obatch)
-  // 	       : batch.nbatch))
-  //     tr.bind(filters, filtersT)
-  //     tr.bind(biasa, biasaT)
-  //     tr.bind(biasb, biasbT)
-  //     tr.call()
-  //     var end = +new Date()
-  //     var spent = end - start
+    console.log('finished layer', new Date().toString())
+    var c = sa.nextLayer()
+    if (!c)
+      break}
 
-  //     if (nonoise) {
-  // 	if (test) {
-  // 	  var rec = tr.valueForId(recons.id)
-  // 	  for (var b = 0; b < Math.min(5, minibatchSize); b++) {
-  // 	    var patch = batch.patches[b]
-  // 	    var re = decodeData(patch, rec[b])
-  // 	    console.log(patch.toString())
-  // 	    re.sort(function (a,b) {return b.doPlay - a.doPlay})
-  // 	    for (var i = 0; i < 5; i++) {
-  // 	      var r = re[i]
-  // 	      console.log(r.coord.toString(), r.doPlay)}
-  // 	    console.log('\n')
-  // 	  }
-  // 	}
-  //     }
-  //     else {
-  // })
+  sa.saveParameters()
 }
 
 
