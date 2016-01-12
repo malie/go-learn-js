@@ -19,7 +19,9 @@ function parseSGFCoordChar(cc) {
   return cc - 97}
 
 function parseSGFCoord(c) {
-  assert(c.length === 2)
+  if (c.length != 2) {
+    console.log('bad coord in parseSGFCoord: "' + c + '"')
+    assert(false)}
   var x = parseSGFCoordChar(c.charCodeAt(0))
   var y = 18-parseSGFCoordChar(c.charCodeAt(1))
   return new go.coord(x, y)}
@@ -38,11 +40,20 @@ function kgsgamesFromYear(year) {
 
 function sgfFiles() {
   var res = [].concat(
+    kgsgamesFromYear('2015'),
+    kgsgamesFromYear('2014'),
     kgsgamesFromYear('2013'),
     kgsgamesFromYear('2012'),
     kgsgamesFromYear('2011'),
     kgsgamesFromYear('2010'),
-    kgsgamesFromYear('2009'))
+    kgsgamesFromYear('2009'),
+    kgsgamesFromYear('2008'),
+    kgsgamesFromYear('2007'),
+    kgsgamesFromYear('2006'),
+    kgsgamesFromYear('2005'),
+    kgsgamesFromYear('2004'),
+    kgsgamesFromYear('2003'),
+    kgsgamesFromYear('2002'))
   console.log('num sgf files:', res.length)
   return res}
 
@@ -51,8 +62,8 @@ function randomArrayElement(ary) {
 
 
 function replayGame(filename, callback, error) {
-  var example = fs.readFileSync(filename, { encoding: 'utf8' })
-  var content = sgf.parse(example)
+  var sgfFile = fs.readFileSync(filename, { encoding: 'utf8' })
+  var content = sgf.parse(sgfFile)
   if (!content.gameTrees)
     return null
   var g = smartgamer(content)
@@ -70,9 +81,10 @@ function replayGame(filename, callback, error) {
 
   g.goTo(0)
   var n0 = g.node()
-  if (n0.SZ != '19')
-    return
-  if (n0.GM != '1')
+  if (n0.GM != '1'
+      || n0.SZ != '19'
+      || n0.RU != 'Japanese'
+      || n0.AW)
     return
   if (n0.AB) {
     for (var p of n0.AB)
@@ -97,11 +109,11 @@ function replayGame(filename, callback, error) {
       /*console.log('pass')*/}
     else if (col === null) {
       console.log('couldnt read color', b, w, nd)
-      return error('parse move', board, nd, col, coord)}
+      return error && error('parse move', board, nd, col, coord)}
     else if (!board.canPlace(col, coord)) {
       console.log(util.inspect(content, 0, 7))
       console.log(filename)
-      return error('!canPlace', board, nd, col, coord)}
+      return error && error('!canPlace', board, nd, col, coord)}
     else {
       var res = callback(i, board, col, coord)
       if (!res)
@@ -127,25 +139,31 @@ function extractSomePatches(n, pred, prob, extract) {
   while (1) {
     var filename = randomArrayElement(gamefiles)
     // console.log(filename)
-    replayGame(
-      filename,
-      function (i, board, col, coord) {
-	if (pred(i, col, coord)
-	    && Math.random() < prob) {
-	  var patch = extract(board, col, coord)
-	  if (patch) {
-	    // console.log('extract patch', i, col, coord.toString())
-	    // console.log(board.toString())
-	    // console.log(patch.toString())
-	    patches.push(patch)
-	    if (patches.length >= n)
-	      return false}}
-	return true},
-      function (msg, board, nd, col, coord) {
-	console.log('error', msg, 'col', col,
-		    'at', coord && coord.toString())
-	// console.log(board.toString())
-      })
+    try {
+      replayGame(
+	filename,
+	function (i, board, col, coord) {
+	  if (pred(i, col, coord)
+	      && Math.random() < prob) {
+	    var patch = extract(board, col, coord)
+	    if (patch) {
+	      // console.log(board.toString())
+	      // console.log(patches.length,
+	      //	  'extract patch', i, col, coord.toString())
+	      // console.log(patch.toString())
+	      patches.push(patch)
+	      if (patches.length >= n)
+		return false}}
+	  return true},
+	function (msg, board, nd, col, coord) {
+	  console.log('error', msg, 'col', col,
+		      'at', coord && coord.toString())
+	  // console.log(board.toString())
+	})
+    } catch (e) {
+      console.log(e)
+      console.log(e.stack)
+      console.trace('couldnt replay', filename)}
     if (patches.length >= n)
       break}
   return patches}
@@ -165,23 +183,43 @@ function distanceToCorner(coord) {
 function randint(n) {
   return Math.floor(Math.random()*n)}
 
-function randintFromTo(a, b) {
-  var len = b - a + 1
-  return a + randint(len)}
+function normalizeRectangleBase(co, width, height) {
+  var x = co.x()
+  var y = co.y()
+  x = Math.min(x, 18-x-width+1)
+  y = Math.min(y, 18-y-height+1)
+  if (y > x) {
+    var t = x
+    x = y
+    y = t}
+  return new go.coord(x, y)}
 
-function extractPatch(width, height, board, col, coord, place) {
+function extractPatch(width, height, board, col, coord, baseCoord) {
+
   var cx = coord.x()
   var cy = coord.y()
-  // px/py is the lower left corner of the patch
-  var minx = Math.max(0, cx-width+1)
-  var maxx = Math.min(18-width, cx)
-  var miny = Math.max(0, cy-height+1)
-  var maxy = Math.min(18-height, cy)
-  var pl = place(minx, maxx, miny, maxy)
-  if (!pl) return null
-  var px = pl[0]
-  var py = pl[1]
 
+  // px/py is the lower left corner of the patch.
+  // any spots that coincide with baseCoord after normalisation are good
+  var minx = Math.max(0, cx-width+1)
+  var maxx = Math.min(18-width+1, cx)
+  var miny = Math.max(0, cy-height+1)
+  var maxy = Math.min(18-height+1, cy)
+
+  var options = []
+  for (var mx = minx; mx <= maxx; mx++)
+    for (var my = miny; my <= maxy; my++) {
+      var q = new go.coord(mx, my)
+      var n = normalizeRectangleBase(q, width, height)
+      if (baseCoord.equals(n))
+	options.push(q)}
+  var pl = randomArrayElement(options)
+
+  return extractPatchAt(width, height, board, col, coord, pl)}
+
+function extractPatchAt(width, height, board, col, coord, pl) {
+  var px = pl.x()
+  var py = pl.y()
   var lines = []
   for (var yi = 0; yi < height; yi++) {
     var y = py + yi
@@ -197,7 +235,7 @@ function extractPatch(width, height, board, col, coord, place) {
 	libs = board.numLibsAt(co)
       line.push({col: st,
 		 libs: libs,
-		 next: coord.equals(co) ? true : false})}
+		 next: coord && co.equals(coord) ? true : false})}
     lines.push(line)}
   return new patch(new go.coord(px, py), lines)}
 
@@ -275,41 +313,26 @@ class patch {
     return new patch(this.coord, lines)}
 }
 
-function normalizePatch(p) {
-  if (p.coord.x() > 9)
+function normalizePatch(p, width, height) {
+  // also see normalizeRectangleBase()
+  
+  var x = p.coord.x()
+  var y = p.coord.y()
+
+  var ox = 18-x-width+1
+  if (ox < x) {
     p = p.flipVertically()
-  if (p.coord.y() > 9)
+    x = ox}
+
+  var oy = 18-y-height+1
+  if (oy < y) {
     p = p.flipHorizontally()
-  if (p.coord.y() > p.coord.x())
+    y = oy}
+  
+  if (y > x)
     p = p.swapAxes()
   return p}
 
-function placeInCorner(patternWidth,
-		       patternHeight,
-		       maxDistanceToCorner)
-{
-  var ri = 18 - patternWidth + 1
-  var to = 18 - patternHeight + 1
-  return function (minx, maxx, miny, maxy) {
-    for (var i = 0; i < 20; i++) {
-      var px = randintFromTo(minx, maxx)
-      if (minx == 0 && Math.random() < 0.9) px = 0
-      if (maxx == ri && Math.random() < 0.9) px = ri
-      var py = randintFromTo(miny, maxy)
-      if (miny == 0 && Math.random() < 0.9) py = 0
-      if (maxy == to && Math.random() < 0.9) py = to
-      
-      var cx = px
-      if (cx > 9)
-	cx += patternWidth-1
-      var cy = py
-      if (cy > 9)
-	cy += patternHeight-1
-      
-      var co = new go.coord(cx, cy)
-      if (distanceToCorner(co) <= maxDistanceToCorner)
-	return [px, py]}
-    return null}}
 
 function arrayShuffle(ary) {
   for (var i = 0; i < ary.length; i++) {
@@ -318,43 +341,28 @@ function arrayShuffle(ary) {
     ary[i] = ary[r]
     ary[r] = t}}
 
-function batchedPatchesPerPlace(pw, ph, batchsize, callback) {
-  var pl = new Map()
-  while (1) {
-    var patches =
-      extractSomePatches(
-	1000,
-	(i, col, coord) => distanceToCorner(coord) <= 5,
-	0.4,
-	function (board, col, coord) {
-	  var p = extractPatch(pw, ph, board, col, coord,
-			       placeInCorner(pw, ph, 1))
-	  if (p && p.numStones() >= 4)
-	    return normalizePatch(p)
-	  else
-	    return null})
-    for (var p of patches) {
-      var idx = p.coord.index()
-      var l = null
-      if (pl.has(idx))
-	l = pl.get(idx)
-      else {
-	l = []
-	pl.set(idx, l)}
-      l.push(p)}
-    var npl = new Map()
-    for (var idx of pl.keys()) {
-      var patches = pl.get(idx)
-      if (patches.length >= 2*batchsize) {
-	arrayShuffle(patches)
-	while (patches.length >= batchsize) {
-	  var take = patches.slice(0, batchsize)
-	  patches = patches.slice(batchsize)
-	  var co = go.coord.fromIndex(idx)
-	  if (!callback(co, take))
-	    return 'done'}}
-      npl.set(idx, patches)}
-    pl = npl}}
+function batchedPatches(range, pw, ph, batchsize, p) {
+  p = p | 0.3
+  var sh = 43
+  var patches = extractSomePatches(
+    sh*batchsize,
+    (i, col, coord) => range.liesWithin(coord),
+    0.3,
+    function (board, col, coord) {
+      var p = extractPatch(pw, ph, board, col, coord, range.base)
+      if (p && p.numStones() >= 4)
+	return normalizePatch(p, pw, ph)
+      else
+	return null})
+  arrayShuffle(patches)
+  var batches = []
+  while (patches.length > 0) {
+    assert(patches.length >= batchsize)
+    batches.push(new goBatch(patches.slice(0, batchsize)))
+    patches = patches.slice(batchsize)}
+  return batches}
+
+  
 
 function encodePatch(patch) {
   var bits = []
@@ -386,7 +394,7 @@ function encodePatch(patch) {
 	add(w && o.libs >= 4)}}}
   return bits}
 
-function decodeData(patch, dat) {
+function decodeDataPlayDontPlay(patch, dat) {
   var res = []
   var ptr = 0
   function get(x) {
@@ -414,13 +422,6 @@ function decodeData(patch, dat) {
   assert.equal(dat.length, ptr)
   return res}
 
-
-function prepareMinibatches(pw, ph, minibatchSize, callback) {
-  batchedPatchesPerPlace(
-    pw, ph, minibatchSize,
-    function (coord, patches) {
-      var batch = new goBatch(coord, patches)
-      return callback(batch)})}
 
 
 class abstractLayer {
@@ -481,9 +482,13 @@ class autoencoderLayer extends stdLayer {
     this.filters = t.tensor('filters', [this.numFilters, numInputs])
     this.biasa = t.tensor('biasa', [this.numFilters])
     this.biasb = t.tensor('biasb', [numInputs])
-    this.filtersT = ad.randomTensor([this.numFilters, numInputs], 0.03)
-    this.biasaT = ad.randomTensor([this.numFilters], 0.01)
-    this.biasbT = ad.randomTensor([numInputs], 0.01)}
+    if (!this.filtersT) {
+      var filtersShape = [this.numFilters, numInputs]
+      this.filtersT = ad.randomTensor(filtersShape, 0.03)}
+    if (!this.biasaT)
+      this.biasaT = ad.randomTensor([this.numFilters], 0.01)
+    if (!this.biasbT)
+      this.biasbT = ad.randomTensor([numInputs], 0.01)}
 
   numParameters() {
     return (ad.shapeNumElements(this.filters.shape())
@@ -597,6 +602,16 @@ class autoencoderLayer extends stdLayer {
 	    filters: this.filtersT,
 	    biasa: this.biasaT,
 	    biasb: this.biasbT}}
+  
+  static reconstructFromJson(t, l) {
+    var layerdef = {numFilters: l.numOutputs,
+		    numBatches: null}
+    var ae = new autoencoderLayer(t, layerdef)
+    ae.filtersT = l.filters
+    ae.biasaT = l.biasa
+    ae.biasbT = l.biasbT
+    return ae}
+
 }
 
 function round(d, x) {
@@ -609,7 +624,7 @@ function withTiming(start, end, obj) {
 
 class stackedAutoencoders {
   constructor(t, inputLayer, layerdefs) {
-    console.log('layerdefs', layerdefs)
+    layerdefs && console.log('layerdefs', layerdefs)
     this.t = t
     this.inputLayer = inputLayer
     this.layerdefs = layerdefs
@@ -700,13 +715,13 @@ class stackedAutoencoders {
     var errp = round(3, Math.sqrt(err / ae.numInputs() / batchSize))
     return {err: err, errp: errp}}
   
-  testPredictionBatch(batch) {
+  testPredictionBatch(batch, reallyPredict) {
     var ae = this.layers[this.current]
     var origInputT = batch.encodeOrig()
     var predInputT = null
     var start = +new Date()
     if (this.current === 0) {
-      predInputT = batch.encodePred()
+      predInputT = reallyPredict ? batch.encodePred() : origInputT
       var f = ae.compileErrorFunction()
       f.bind(ae.noisedInput, predInputT)
       f.bind(ae.origInput, origInputT)
@@ -715,7 +730,7 @@ class stackedAutoencoders {
       return {err: f.valueForId(ae.err.id),
 	      recons: f.valueForId(ae.recons.id)}}
     else {
-      var nnbatch = batch.cloneBatchWithNoNext()
+      var nnbatch = reallyPredict ? batch.cloneBatchWithNoNext() : batch
       var hidT = this.mapBatchThroughLayers(nnbatch, this.current+1)
       var recons = this.mapBatchBackThroughLayers(hidT, this.current)
       var err = squaredDiff(origInputT, recons)
@@ -727,6 +742,23 @@ class stackedAutoencoders {
     var params = this.layers.map(l => l.parametersForSaving())
     fs.writeFileSync(filename, JSON.stringify(params))
     console.log('wrote parameters to', filename)}
+
+  static reconstructFromJson(dat) {
+    var t = new ad.T()
+    var layers = dat.map(
+      l => autoencoderLayer.reconstructFromJson(t, l))
+    var inp = new inputLayer(dat[0].numInputs)
+    var l = inp
+    for (var i = 0; i < layers.length; i++) {
+      l.setLayerAbove(layers[i])
+      l = layers[i]}
+    for (var layer of layers)
+      layer.finish()
+    var layerdefs = null
+    var sa = new stackedAutoencoders(t, inputLayer, layerdefs)
+    sa.layers = layers
+    sa.current = layers.length-1
+    return sa}
 }
 
 
@@ -740,16 +772,14 @@ function squaredDiff(a, b) {
 
 
 class goBatch {
-  constructor(coord, patches) {
-    this.coord = coord
+  constructor(patches) {
     this.patches = patches}
   batchSize() {
     return this.patches.length}
   encodeOrig() {
     return this.patches.map(encodePatch)}
   cloneBatchWithNoNext() {
-    return new goBatch(this.coord,
-		       this.patches.map(p => p.cloneWithNoNext()))}
+    return new goBatch(this.patches.map(p => p.cloneWithNoNext()))}
   encodePred() {
     return (this.patches
 	    .map(p => encodePatch(p.cloneWithNoNext())))}
@@ -771,7 +801,7 @@ function reportPrediction(batch, recons) {
   var numExamples = Math.min(10, batch.batchSize())
   for (var b = 0; b < numExamples; b++) {
     var patch = batch.patches[b]
-    var re = decodeData(patch, recons[b])
+    var re = decodeDataPlayDontPlay(patch, recons[b])
     console.log(patch.toString())
     re.sort(function (a,b) {return b.doPlay - a.doPlay})
     var output = []
@@ -783,26 +813,52 @@ function reportPrediction(batch, recons) {
     console.log(output.join('  ') + '\n')}}
 
 
+class coordRange {
+  // range is square
+  // size is towards center
+  constructor(base, size) {
+    this.base = this.normalize(base)
+    this.size = size}
+  liesWithin(co) {
+    co = this.normalize(co)
+    var x = co.x()
+    var y = co.y()
+    var bx = this.base.x()
+    var by = this.base.y()
+    var res = (x >= bx
+	       && y >= by
+	       && x < bx+this.size
+	       && y < by+this.size)
+    // console.log('check if', co.toString(), 'is in range:', res)
+    return res}
+  normalize(co) {
+    var x = co.x()
+    var y = co.y()
+    if (x > 9)
+      x = 18-x
+    if (y > 9)
+      y = 18-y
+    if (y > x) {
+      var t = y
+      y = x
+      x = t}
+    return new go.coord(x, y)}
+}
 
-function learn() {
-  var patternSize = 5
-  var noiseLevel = 0.01
-  var minibatchSize = 100
+
+function learn(args, layerdefs) {
+  var patternSize = args.patternSize
+  var noiseLevel = args.noiseLevel
+  var minibatchSize = args.minibatchSize
+  var learnRate = args.learnRate
+  
   var dataSize = ((patternSize-2)*(patternSize-2)*5
 		  + (2*patternSize-2)*2*13)
-  var learnRate = 0.001
 
-  console.log('noiseLevel', noiseLevel)
-  console.log('minibatchSize', minibatchSize)
-  console.log('learnRate', learnRate)
-  
   var t = new ad.T()
   var input = new inputLayer(dataSize)
-  var sa = new stackedAutoencoders(
-    t, input,
-    [{numFilters: 200, numBatches: 4000},
-     {numFilters: 200, numBatches: 5000},
-     {numFilters: 200, numBatches: 6000}])
+  var sa = new stackedAutoencoders(t, input, layerdefs)
+  var range = new coordRange(args.baseCoord, patternSize)
 
   while (true) {
     console.log('starting layer', new Date().toString())
@@ -810,35 +866,38 @@ function learn() {
 
     var count = 0
     var t = 1
-    prepareMinibatches(
-      patternSize, patternSize,
-      minibatchSize,
-      function (batch) {
-	if (batch.coord.toString() != 'A1') return true
-	count++
-	var modCount = count % 100
-	if (modCount < 100-2*t) {
-	  var res = sa.learnBatch(batch, learnRate, noiseLevel)
-	  console.log('' + res.numProcessedBatches
-		      + '\terr ' + round(0, res.err)
+    var batches = []
+    while (1) {
+      if (batches.length == 0)
+	batches = batchedPatches(range, patternSize, patternSize,
+				 minibatchSize)
+      var batch = batches.pop()
+      count++
+      var modCount = count % 100
+      if (modCount < 100-3*t) {
+	var res = sa.learnBatch(batch, learnRate, noiseLevel)
+	console.log('' + res.numProcessedBatches
+		    + '\terr ' + round(0, res.err)
+		    + ' ' + round(3, res.errp)
+		    + '\t' + res.spent + 'ms')}
+      else {
+	var reconsLocal = modCount == 97
+	if (reconsLocal) {
+	  var res = sa.testReconsBatch(batch)
+	  console.log('lrec\terr ' + round(0, res.err)
 		      + ' ' + round(3, res.errp)
 		      + '\t' + res.spent + 'ms')}
 	else {
-	  var predict = modCount >= 100-t
-	  if (!predict) {
-	    var res = sa.testReconsBatch(batch)
-	    console.log('   \terr ' + round(0, res.err)
-			+ ' ' + round(3, res.errp)
-			+ '\t' + res.spent + 'ms')
-	    //if (res.errp < 0.23) // 0.23//0.19//0.16 // 0.13 // 0.10
-	  }
+	  var globalRecons = modCount == 98
+	  if (globalRecons) {
+	    var res = sa.testPredictionBatch(batch, false)
+	    console.log('grec\terr', res.err)}
 	  else {
-	    var res = sa.testPredictionBatch(batch)
+	    var res = sa.testPredictionBatch(batch, true)
 	    console.log('test prediction err', res.err)
 	    reportPrediction(batch, res.recons)
 	    if (sa.isTrainingForCurrentLayerFinished())
-	      return false}}
-	return true})
+	      break}}}}
 
     console.log('finished layer', new Date().toString())
     var c = sa.nextLayer()
@@ -848,5 +907,199 @@ function learn() {
   sa.saveParameters()
 }
 
+function parseArguments() {
+  var args = process.argv.slice(2)
+  var res = {patternSize: 5,
+	     noiseLevel: 0.1,
+	     learnRate: 0.01,
+	     minibatchSize: 100,
+	     numBatches: 6000,
+	     numLayers: 3,
+	     numFilters: 200}
+  while (args.length > 0) {
+    var a = args[0]
+    if (a == '--base-coord') {
+      res.baseCoord = go.coord.fromName(args[1])
+      args = args.slice(2)}
+    else if (a == '--noise-level') {
+      res.noiseLevel = parseFloat(args[1])
+      args = args.slice(2)}
+    else if (a == '--learn-rate') {
+      res.learnRate = parseFloat(args[1])
+      args = args.slice(2)}
+    else if (a == '--pattern-size') {
+      res.patternSize = parseInt(args[1])
+      args = args.slice(2)}
+    else if (a == '--minibatch-size') {
+      res.minibatchSize = parseInt(args[1])
+      args = args.slice(2)}
+    else if (a == '--num-filters') {
+      res.numFilters = parseInt(args[1])
+      args = args.slice(2)}
+    else if (a == '--num-layers') {
+      res.numLayers = parseInt(args[1])
+      args = args.slice(2)}
+    else if (a == '--num-batches') {
+      res.numBatches = parseInt(args[1])
+      args = args.slice(2)}}
+  console.log('final arguments:')
+  console.log(util.inspect(res, 0, 10))
+  return res}
 
-learn()
+function runLearn() {
+  var args = parseArguments()
+  var layerdefs = []
+  for (var i = 0; i < args.numLayers; i++)
+    layerdefs.push({numFilters: args.numFilters,
+		    numBatches: args.numBatches})
+  learn(args, layerdefs)}
+
+function readJsonFile(filename) {
+  return JSON.parse(
+    fs.readFileSync(filename, {encoding: 'utf8'}))}
+  
+
+class autoencoders {
+  constructor(listfile) {
+    this.dirname = path.dirname(listfile)
+    this.autoencoders =
+      readJsonFile(listfile)
+      .map(e => ({base: go.coord.fromName(e.base),
+		  file: e.file}))
+    this.loaded = new Map()}
+  atBase(co) {
+    var index = co.index()
+    var ae = this.loaded.get(index)
+    if (!ae) {
+      ae = this.loadAutoencoder(co)
+      this.loaded.set(index, ae)}
+    return ae}
+  loadAutoencoder(co) {
+    for (var def of this.autoencoders) {
+      if (def.base.equals(co))
+	return this.loadAutoencoderFromFile(def)}
+    throw 'no such autoencoder'}
+  loadAutoencoderFromFile(def) {
+    var ae = readJsonFile(path.join(this.dirname, def.file))
+    return stackedAutoencoders.reconstructFromJson(ae)}
+}
+
+function buildPartialPatch(width, height, knowns) {
+  var lines = []
+  for (var yi = 0; yi < height; yi++) {
+    var line = []
+    for (var xi = 0; xi < width; xi++)
+      line.push(null)
+    lines.push(line)}
+  for (var k of knowns)
+    lines[k.y][k.x] = {col: k.col,
+		       libs: null,
+		       next: null}
+  return new patch(new go.coord(0, 0), lines)}
+
+function arrayReversed(ary) {
+  var res = Array.from(ary)
+  res.reverse()
+  return res}
+
+function decodeDataBlackWhiteEmpty(patch, dat) {
+  var res = []
+  var ptr = 0
+  function get(x) {
+    return dat[ptr++]}
+  var xb = patch.coord.x()
+  var yb = patch.coord.y()
+  var lsl = patch.lines.length
+  var ll = patch.lines[0].length
+  for (var i = 0; i < lsl; i++) {
+    for (var j = 0; j < ll; j++) {
+      var border = i === 0 || j === 0 || i === lsl-1 || j === ll-1
+      var b = get() // b
+      var w = get() // w
+      var e = get() // empty
+      get() // play
+      get() // dont play
+      if (border) {
+	get();get();get();get(); // 1,2,3,>=4 libs b
+	get();get();get();get(); // 1,2,3,>=4 libs w
+      }
+      res.push({coord: new go.coord(xb+j, yb+i),
+		b: b,
+		w: w,
+		e: e})
+    }}
+  assert.equal(dat.length, ptr)
+  return res}
+
+function batchBernoulliSample(batch) {
+  return batch.map(bernoulliSample)}
+
+function bernoulliSample(dat) {
+  return dat.map(sample)}
+
+function sample(p) {
+  return p > Math.random() ? 1.0 : 0.0}
+  
+function someSamplePatches(base, pw, ph, f) {
+  replayGame(
+    // '../kgsgames/2015/9/22/sum-muslinca.sgf'
+    '../kgsgames/2015/3/9/twoeye-MrBaduk.sgf'
+    ,
+    function (i, board, col, coord) {
+      if (distanceToCorner(coord) <= 4 && Math.random() < 0.99) {
+	var p = extractPatch(pw, ph, board, col, coord, base)
+	if (p && p.numStones() >= 4)
+	  f(normalizePatch(p, pw, ph))}
+      return true})}
+
+  ////// var knowns = [
+  //////   // {x: 2, y: 2, col: go.black}
+  //////   {x: 2, y: 2, col: go.black},
+  //////   {x: 3, y: 2, col: go.black}
+  ////// ]
+  ////// var p = buildPartialPatch(5, 5, knowns)
+  ////// console.log(p.toString())
+  ////// var batch = new goBatch([p])
+
+function sample() {
+  var as = new autoencoders('ae-5-nl4/list.js')
+  // console.log(util.inspect(as, 0, 4))
+  var base = new go.coord(0,0)
+  var A1ae = as.atBase(base)
+
+  var pw = 5
+  var ph = 5
+  someSamplePatches(
+    base, pw, ph,
+    function (patch) {
+      console.log(patch.toString())
+      var batch = new goBatch([patch])
+      var dat = batch.encodeOrig()
+      for (var l of A1ae.layers)
+	dat = l.mapBatch(dat)
+      for (var l of arrayReversed(A1ae.layers)) {
+	// dat = batchBernoulliSample(dat)
+	dat = l.mapBatchBack(dat)
+      }
+
+      var nboard = new go.board()
+      var decoded = decodeDataBlackWhiteEmpty(patch, dat[0])
+      for (var d of decoded) {
+	var sum = d.b + d.w + d.e
+	var b = d.b / sum
+	var w = d.w / sum
+	var bw = b+w
+	var r = Math.random()
+	if (r < bw) {
+	  var col = go.white
+	  if (r < b)
+	    col = go.black
+	  nboard.place(col, d.coord)}}
+      var np = extractPatchAt(pw, ph, nboard, go.black, null, base)
+      console.log(np.toString())
+      console.log('\n\n')
+    })
+}
+
+// runLearn()
+sample()
